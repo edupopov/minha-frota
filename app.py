@@ -12,6 +12,7 @@ import sqlite3
 import sys
 import threading
 import webbrowser
+import mimetypes
 from contextlib import closing
 from datetime import date
 from http import HTTPStatus
@@ -23,6 +24,8 @@ APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / 
 DB_PATH = APP_DIR / "minha_frota.sqlite3"
 HOST, PORT = "127.0.0.1", int(os.environ.get("MINHA_FROTA_PORT", "3001"))
 PLATE_RE = re.compile(r"^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$")
+PROJECT_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = PROJECT_DIR / "assets"
 
 HOME_PAGE = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Minha Frota — API local</title><style>
 *{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#14213d;font:16px Segoe UI,Arial,sans-serif}.top{background:#102a4c;color:white;padding:26px max(6vw,24px)}h1{margin:0;font-size:30px}.top p{opacity:.8;margin:7px 0 0}.main{max-width:1100px;margin:26px auto;padding:0 24px}.summary,.vehicles{display:grid;gap:16px}.summary{grid-template-columns:repeat(3,1fr);margin-bottom:24px}.card{background:white;border-radius:14px;padding:20px;box-shadow:0 4px 18px #16325c14}.label{color:#637490;font-size:13px}.number{font-size:25px;font-weight:700;margin-top:7px}.vehicle{border-left:5px solid #1683ff}.vehicle h3{margin:0 0 10px}.meta{color:#526680;font-size:14px;margin:5px 0}button{border:0;border-radius:8px;background:#087cff;color:#fff;font-weight:600;padding:11px 15px;cursor:pointer}button:hover{background:#0066d7}form{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:20px 0}input,select{border:1px solid #cbd7e7;border-radius:8px;padding:10px;font:inherit}.notice{min-height:24px;color:#16733a;font-weight:600}@media(max-width:720px){.summary,form{grid-template-columns:1fr}.main{padding:0 15px}}
@@ -62,6 +65,9 @@ def connect() -> sqlite3.Connection:
 
 def rows(conn, sql, params=()):
     return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+def load_home_page() -> str:
+    return (PROJECT_DIR / "dashboard.html").read_text(encoding="utf-8")
 
 def init_database() -> None:
     with closing(connect()) as conn:
@@ -118,6 +124,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers(); self.wfile.write(encoded)
 
+    def send_asset(self, asset_name):
+        if asset_name not in {"sedan.png", "motorcycle.png"}:
+            return self.send_json(404, {"error": {"code":"not_found", "message":"Arquivo não encontrado."}})
+        content = (ASSETS_DIR / asset_name).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(asset_name)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers(); self.wfile.write(content)
+
     def body(self):
         length = int(self.headers.get("Content-Length", "0"))
         if length > 1_000_000: raise ValueError("Corpo da requisicao excede 1 MB.")
@@ -140,7 +156,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             parsed = urlparse(self.path); path = parsed.path.rstrip("/") or "/"; query = parse_qs(parsed.query)
             if method == "GET" and path == "/":
-                return self.send_html(200, HOME_PAGE)
+                return self.send_html(200, load_home_page())
+            if method == "GET" and path.startswith("/assets/"):
+                return self.send_asset(path.removeprefix("/assets/"))
             if not path.startswith("/api/"):
                 return self.send_json(404, {"error": {"code":"not_found", "message":"Rota nao encontrada."}})
             with closing(connect()) as conn:
@@ -150,7 +168,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     sql, args = "SELECT * FROM vehicles", []
                     if query.get("type"):
                         sql += " WHERE type=?"; args.append(query["type"][0])
-                    sql += " ORDER BY status='ativo' DESC, brand, model"
+                    sql += " ORDER BY status='ativo' DESC, id"
                     return self.send_json(200, {"data":rows(conn, sql, args)})
                 if method == "POST" and path == "/api/vehicles":
                     fields = vehicle_payload(self.body())
@@ -192,6 +210,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                     cur = conn.execute("""INSERT INTO records(vehicle_id,kind,category,description,due_date,performed_on,amount,status,odometer_km,details)
                       VALUES (?,?,?,?,?,?,?,?,?,?)""", (data["vehicle_id"],data["kind"],data["category"],data["description"],data.get("due_date"),data.get("performed_on"),data.get("amount",0),data.get("status","pendente"),data.get("odometer_km"),data.get("details"))); conn.commit()
                     return self.send_json(201, {"data":dict(conn.execute("SELECT * FROM records WHERE id=?", (cur.lastrowid,)).fetchone())})
+                record_match = re.fullmatch(r"/api/records/(\d+)", path)
+                if record_match and method == "PUT":
+                    data = self.body(); allowed = {"category", "description", "due_date", "performed_on", "amount", "status", "odometer_km", "details"}
+                    fields = {key: value for key, value in data.items() if key in allowed}
+                    if not fields: raise ValueError("Informe ao menos um campo válido para atualizar.")
+                    if "status" in fields and fields["status"] not in ("pendente", "pago", "atrasado", "concluido", "ativo"):
+                        raise ValueError("Situação do registro inválida.")
+                    ident = int(record_match.group(1))
+                    cur = conn.execute(f"UPDATE records SET {','.join(f'{key}=?' for key in fields)} WHERE id=?", [*fields.values(), ident]); conn.commit()
+                    if not cur.rowcount: return self.send_json(404, {"error":{"code":"not_found","message":"Registro não encontrado."}})
+                    return self.send_json(200, {"data":dict(conn.execute("SELECT * FROM records WHERE id=?", (ident,)).fetchone())})
                 if method == "GET" and path == "/api/reports/costs":
                     return self.send_json(200, {"data":rows(conn, "SELECT kind, category, ROUND(SUM(amount),2) AS total FROM records GROUP BY kind,category ORDER BY total DESC")})
                 return self.send_json(404, {"error":{"code":"not_found","message":"Rota nao encontrada."}})
